@@ -1,0 +1,35 @@
+# Build output
+Debug/
+Release/
+build/
+out/
+
+# Compiled artifacts
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.d
+*.su
+*.cyclo
+*.exe
+
+# Generated make fragments
+*.mk
+makefile
+objects.list
+
+# IDE and OS noise
+.metadata/
+.recommenders/
+.vscode/
+.idea/
+*.launch
+*.tmp
+*.log
+Thumbs.db
+Desktop.ini
+
