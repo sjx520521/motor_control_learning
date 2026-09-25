@@ -32,6 +32,7 @@ void motion_controller_init(MotionController *controller,
     controller->velocity_reference = 0.0f;
     controller->torque_reference = 0.0f;
     controller->position_reference = initial_position;
+    controller->mode = MOTION_CONTROL_MODE_POSITION;
     controller->initialized = 1U;
 }
 
@@ -63,6 +64,154 @@ void motion_controller_set_feedback(MotionController *controller,
 
     controller->last_position = position;
     controller->filtered_velocity = velocity;
+}
+
+void motion_controller_set_impedance_gains(MotionController *controller,
+                                           float position_stiffness,
+                                           float velocity_damping)
+{
+    if (controller == 0 || controller->initialized == 0U)
+    {
+        return;
+    }
+
+    if (position_stiffness < 0.0f)
+    {
+        position_stiffness = 0.0f;
+    }
+    if (velocity_damping < 0.0f)
+    {
+        velocity_damping = 0.0f;
+    }
+
+    controller->config.position_kp = position_stiffness;
+    controller->config.velocity_kp = velocity_damping;
+    /*
+     * MIT-style impedance control has proportional position and velocity
+     * terms plus feedforward torque; it does not use a velocity integrator.
+     */
+    controller->config.velocity_ki = 0.0f;
+}
+
+void motion_controller_set_mode(MotionController *controller,
+                                MotionControlMode mode)
+{
+    if (controller == 0 || controller->initialized == 0U)
+    {
+        return;
+    }
+
+    if (mode > MOTION_CONTROL_MODE_IMPEDANCE)
+    {
+        mode = MOTION_CONTROL_MODE_POSITION;
+    }
+
+    controller->mode = mode;
+    controller->velocity_integral = 0.0f;
+}
+
+float motion_controller_update_mode(
+    MotionController *controller,
+    MotionControlMode mode,
+    float position_reference,
+    float velocity_reference,
+    float position_stiffness,
+    float velocity_damping,
+    float torque_feedforward,
+    float dt_seconds)
+{
+    return motion_controller_update_mode_scheduled(
+        controller,
+        mode,
+        position_reference,
+        velocity_reference,
+        position_stiffness,
+        velocity_damping,
+        torque_feedforward,
+        dt_seconds,
+        1U);
+}
+
+float motion_controller_update_mode_scheduled(
+    MotionController *controller,
+    MotionControlMode mode,
+    float position_reference,
+    float velocity_reference,
+    float position_stiffness,
+    float velocity_damping,
+    float torque_feedforward,
+    float dt_seconds,
+    uint8_t update_position)
+{
+    float torque_reference;
+
+    if (controller == 0 || controller->initialized == 0U)
+    {
+        return 0.0f;
+    }
+
+    if (controller->mode != mode)
+    {
+        motion_controller_set_mode(controller, mode);
+    }
+
+    switch (controller->mode)
+    {
+    case MOTION_CONTROL_MODE_POSITION:
+        controller->config.position_kp = position_stiffness;
+        if (update_position != 0U)
+        {
+            motion_controller_update_position_loop(
+                controller,
+                position_reference,
+                velocity_reference,
+                dt_seconds);
+        }
+        return motion_controller_update_speed_loop(
+            controller,
+            motion_controller_get_velocity_reference(controller),
+            torque_feedforward,
+            dt_seconds);
+
+    case MOTION_CONTROL_MODE_VELOCITY:
+        return motion_controller_update_speed_loop(
+            controller,
+            velocity_reference,
+            torque_feedforward,
+            dt_seconds);
+
+    case MOTION_CONTROL_MODE_TORQUE:
+        controller->velocity_integral = 0.0f;
+        torque_reference =
+            motion_clamp(torque_feedforward,
+                         controller->config.velocity_output_min,
+                         controller->config.velocity_output_max);
+        controller->torque_reference = torque_reference;
+        return torque_reference;
+
+    case MOTION_CONTROL_MODE_IMPEDANCE:
+        controller->velocity_integral = 0.0f;
+        controller->position_reference =
+            motion_clamp(position_reference,
+                         controller->config.position_min,
+                         controller->config.position_max);
+        torque_reference =
+            torque_feedforward +
+            position_stiffness *
+                (controller->position_reference -
+                 controller->last_position) +
+            velocity_damping *
+                (velocity_reference -
+                 controller->filtered_velocity);
+        controller->torque_reference =
+            motion_clamp(torque_reference,
+                         controller->config.velocity_output_min,
+                         controller->config.velocity_output_max);
+        return controller->torque_reference;
+
+    default:
+        return 0.0f;
+    }
 }
 
 MotionFeedback motion_controller_update_feedback(

@@ -9,6 +9,14 @@ typedef struct
     float velocity;
 } MotionFeedback;
 
+typedef enum
+{
+    MOTION_CONTROL_MODE_POSITION = 0,
+    MOTION_CONTROL_MODE_VELOCITY,
+    MOTION_CONTROL_MODE_TORQUE,
+    MOTION_CONTROL_MODE_IMPEDANCE
+} MotionControlMode;
+
 typedef struct
 {
     float velocity_filter_alpha;
@@ -34,6 +42,7 @@ typedef struct
     float velocity_reference;
     float torque_reference;
     float position_reference;
+    MotionControlMode mode;
     uint8_t initialized;
 } MotionController;
 
@@ -47,6 +56,34 @@ void motion_controller_reset(MotionController *controller,
 void motion_controller_set_feedback(MotionController *controller,
                                     float position,
                                     float velocity);
+
+void motion_controller_set_impedance_gains(MotionController *controller,
+                                           float position_stiffness,
+                                           float velocity_damping);
+
+void motion_controller_set_mode(MotionController *controller,
+                                MotionControlMode mode);
+
+float motion_controller_update_mode(
+    MotionController *controller,
+    MotionControlMode mode,
+    float position_reference,
+    float velocity_reference,
+    float position_stiffness,
+    float velocity_damping,
+    float torque_feedforward,
+    float dt_seconds);
+
+float motion_controller_update_mode_scheduled(
+    MotionController *controller,
+    MotionControlMode mode,
+    float position_reference,
+    float velocity_reference,
+    float position_stiffness,
+    float velocity_damping,
+    float torque_feedforward,
+    float dt_seconds,
+    uint8_t update_position);
 
 MotionFeedback motion_controller_update_feedback(
     MotionController *controller,

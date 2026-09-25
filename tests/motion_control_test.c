@@ -96,12 +96,59 @@ static void test_reset_clears_outer_loop_state(void)
     assert_near(controller.torque_reference, 0.0f);
 }
 
+static void test_impedance_mode_generates_direct_torque(void)
+{
+    MotionController controller;
+    const MotionControlConfig config = test_config();
+
+    motion_controller_init(&controller, &config, 0.0f);
+    motion_controller_set_feedback(&controller, 0.1f, 0.2f);
+
+    const float torque =
+        motion_controller_update_mode(
+            &controller,
+            MOTION_CONTROL_MODE_IMPEDANCE,
+            0.5f,
+            0.0f,
+            2.0f,
+            1.0f,
+            0.3f,
+            0.001f);
+
+    assert_near(torque, 1.1f);
+}
+
+static void test_torque_mode_bypasses_velocity_integrator(void)
+{
+    MotionController controller;
+    const MotionControlConfig config = test_config();
+
+    motion_controller_init(&controller, &config, 0.0f);
+    motion_controller_set_feedback(&controller, 0.0f, 0.0f);
+
+    const float torque =
+        motion_controller_update_mode(
+            &controller,
+            MOTION_CONTROL_MODE_TORQUE,
+            0.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            2.5f,
+            0.001f);
+
+    assert_near(torque, 2.5f);
+    assert_near(controller.velocity_integral, 0.0f);
+}
+
 int main(void)
 {
     test_velocity_calculation_and_filter();
     test_position_limit_and_speed_limit();
     test_speed_pi_and_feedforward();
     test_reset_clears_outer_loop_state();
+    test_impedance_mode_generates_direct_torque();
+    test_torque_mode_bypasses_velocity_integrator();
 
     puts("All motion-control tests passed.");
     return 0;

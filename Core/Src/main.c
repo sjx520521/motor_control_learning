@@ -30,6 +30,8 @@
 #include "motor_state.h"
 #include "motion_control.h"
 #include "dual_encoder.h"
+#include "dual_encoder_spi.h"
+#include "canfd_app.h"
 #include <math.h>
 /* USER CODE END Includes */
 
@@ -52,6 +54,8 @@
 
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
+
+FDCAN_HandleTypeDef hfdcan1;
 
 UART_HandleTypeDef hlpuart1;
 
@@ -100,6 +104,8 @@ float g_i_q = 0.0f;
 
 /* Dual-encoder state: simulated inputs are used until hardware is attached. */
 DualEncoderController g_dual_encoder;
+DualEncoderSpiController g_dual_encoder_spi;
+uint8_t g_dual_encoder_spi_ready = 0U;
 float g_motor_mechanical_angle = 0.0f;
 float g_joint_position = 0.0f;
 float g_motor_speed = 0.0f;
@@ -116,10 +122,9 @@ float g_simulated_joint_encoder_angle = 0.0f;
 #define MOTOR_CURRENT_REFERENCE_Q    (g_iq_reference)
 #define MOTOR_TORQUE_CONSTANT        (0.1f)
 #define MOTOR_MAX_IQ_REFERENCE       (8.0f)
-#define MOTOR_SPEED_LOOP_PERIOD_SECONDS (0.001f)
-#define MOTOR_POSITION_LOOP_PERIOD_SECONDS (0.010f)
-#define MOTOR_SPEED_LOOP_DIVIDER       (20U)
-#define MOTOR_POSITION_LOOP_DIVIDER    (10U)
+#define MOTOR_OUTER_LOOP_PERIOD_SECONDS (1.0f / 2000.0f)
+#define MOTOR_OUTER_LOOP_DIVIDER       (10U)
+#define MOTOR_POSITION_LOOP_DIVIDER    (2U)
 #define MOTOR_OVERCURRENT_LIMIT_AMP  (10.0f)
 #define MOTOR_MIN_BUS_VOLTAGE        (8.0f)
 #define MOTOR_MAX_BUS_VOLTAGE        (30.0f)
@@ -132,7 +137,10 @@ float g_iq_reference = 0.0f;
 float g_simulated_position_reference = 0.0f;
 float g_simulated_velocity_feedforward = 0.0f;
 float g_simulated_torque_feedforward = 0.0f;
-uint16_t g_speed_loop_divider = 0U;
+MotionControlMode g_control_mode = MOTION_CONTROL_MODE_POSITION;
+float g_command_position_stiffness = 10.0f;
+float g_command_velocity_damping = 0.08f;
+uint16_t g_outer_loop_divider = 0U;
 uint8_t g_position_loop_divider = 0U;
 volatile MotorCommand g_pending_motor_command = MOTOR_CMD_NONE;
 
@@ -146,7 +154,16 @@ static void MX_TIM6_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
+static void MX_FDCAN1_Init(void);
 /* USER CODE BEGIN PFP */
+static void motor_control_run_current_loop(void);
+static void motor_control_apply_pending_command(void);
+static void motor_control_update_outer_loops(void);
+static void motor_control_latch_fault(MotorFault fault);
+static MotorFault motor_control_check_protection(
+    const PhaseCurrent *phase_current);
+static void motor_control_reset_current_pi(void);
+static void motor_control_reset_outer_loops(void);
 
 /* USER CODE END PFP */
 
@@ -290,7 +307,7 @@ static void motor_control_init(void)
     motion_controller_reset(&g_motion_controller,
                             g_joint_position);
     g_iq_reference = 0.0f;
-    g_speed_loop_divider = 0U;
+    g_outer_loop_divider = 0U;
     g_position_loop_divider = 0U;
     motor_pwm_disable_outputs();
 }
@@ -300,29 +317,49 @@ static void motor_control_reset_outer_loops(void)
     motion_controller_reset(&g_motion_controller,
                             g_joint_position);
     g_iq_reference = 0.0f;
-    g_speed_loop_divider = 0U;
+    g_outer_loop_divider = 0U;
     g_position_loop_divider = 0U;
 }
 
 static void motor_control_update_outer_loops(void)
 {
-    if (++g_speed_loop_divider < MOTOR_SPEED_LOOP_DIVIDER)
+    int encoder_update_status;
+
+    if (++g_outer_loop_divider < MOTOR_OUTER_LOOP_DIVIDER)
     {
         return;
     }
 
-    g_speed_loop_divider = 0U;
+    g_outer_loop_divider = 0U;
 
-    if (dual_encoder_update(&g_dual_encoder,
-                            g_simulated_motor_encoder_angle,
-                            g_simulated_joint_encoder_angle,
-                            MOTOR_SPEED_LOOP_PERIOD_SECONDS) == 0U)
+    if (g_dual_encoder_spi_ready != 0U)
+    {
+        encoder_update_status =
+            dual_encoder_spi_update(
+                &g_dual_encoder_spi,
+                MOTOR_OUTER_LOOP_PERIOD_SECONDS);
+    }
+    else
+    {
+        encoder_update_status =
+            (dual_encoder_update(
+                 &g_dual_encoder,
+                 g_simulated_motor_encoder_angle,
+                 g_simulated_joint_encoder_angle,
+                 MOTOR_OUTER_LOOP_PERIOD_SECONDS) != 0U) ?
+            ENCODER_SPI_OK :
+            ENCODER_SPI_DECODE_ERROR;
+    }
+
+    if (encoder_update_status != ENCODER_SPI_OK)
     {
         motor_control_latch_fault(MOTOR_FAULT_ENCODER);
         return;
     }
 
     const DualEncoderState *encoder_state =
+        (g_dual_encoder_spi_ready != 0U) ?
+        dual_encoder_spi_get_state(&g_dual_encoder_spi) :
         dual_encoder_get_state(&g_dual_encoder);
     g_motor_mechanical_angle = encoder_state->motor_mechanical_angle;
     g_joint_position = encoder_state->joint_position;
@@ -337,25 +374,22 @@ static void motor_control_update_outer_loops(void)
     if (++g_position_loop_divider >= MOTOR_POSITION_LOOP_DIVIDER)
     {
         g_position_loop_divider = 0U;
-        motion_controller_update_position_loop(
-            &g_motion_controller,
-            g_simulated_position_reference,
-            g_simulated_velocity_feedforward,
-            MOTOR_POSITION_LOOP_PERIOD_SECONDS);
     }
 
-    g_iq_reference =
-        motion_controller_update_speed_loop(
+    const float torque_reference =
+        motion_controller_update_mode_scheduled(
             &g_motion_controller,
-            motion_controller_get_velocity_reference(
-                &g_motion_controller),
+            g_control_mode,
+            g_simulated_position_reference,
+            g_simulated_velocity_feedforward,
+            g_command_position_stiffness,
+            g_command_velocity_damping,
             g_simulated_torque_feedforward,
-            MOTOR_SPEED_LOOP_PERIOD_SECONDS);
-
+            MOTOR_OUTER_LOOP_PERIOD_SECONDS,
+            (g_position_loop_divider == 0U) ? 1U : 0U);
     g_iq_reference =
         mc_clamp_f32(
-            motion_controller_get_torque_reference(
-                &g_motion_controller) / MOTOR_TORQUE_CONSTANT,
+            torque_reference / MOTOR_TORQUE_CONSTANT,
             -MOTOR_MAX_IQ_REFERENCE,
             MOTOR_MAX_IQ_REFERENCE);
 }
@@ -514,6 +548,7 @@ int main(void)
   MX_TIM1_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
+  MX_FDCAN1_Init();
   /* USER CODE BEGIN 2 */
 
   /*
@@ -574,6 +609,7 @@ int main(void)
   }
 
   motor_control_init();
+  canfd_app_init(&hfdcan1, 1U, 20U);
 
   /* USER CODE END 2 */
 
@@ -587,27 +623,58 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    const CanFdControlTarget *can_target;
+
+    canfd_app_update(g_tick_ms);
+    can_target = canfd_app_get_target();
+
+    if (can_target != 0)
+    {
+      g_simulated_position_reference = can_target->position;
+      g_simulated_velocity_feedforward = can_target->velocity;
+      g_simulated_torque_feedforward =
+          can_target->torque_feedforward;
+      g_control_mode = (MotionControlMode)can_target->mode;
+      g_command_position_stiffness = can_target->kp;
+      g_command_velocity_damping = can_target->kd;
+
+      if (can_target->enabled != 0U &&
+          g_motor_controller.state == MOTOR_STATE_READY)
+      {
+        g_pending_motor_command = MOTOR_CMD_START;
+      }
+      else if (can_target->enabled == 0U &&
+               g_motor_controller.state == MOTOR_STATE_RUNNING)
+      {
+        g_pending_motor_command = MOTOR_CMD_STOP;
+      }
+
+    }
+
     motor_control_apply_pending_command();
+
+    if (canfd_app_control_alive() == 0U &&
+        g_motor_controller.state == MOTOR_STATE_RUNNING)
+    {
+      g_pending_motor_command = MOTOR_CMD_STOP;
+    }
 
     if (g_adc_sample_ready != 0U)
     {
       uint16_t raw_a;
       uint16_t raw_b;
+      Phase3 phase_current;
+      AlphaBeta stationary;
+      DqAxis rotating;
+      float sin_theta;
+      float cos_theta;
 
-      /*
-       * Copy ADC results atomically.
-       */
       __disable_irq();
-
       raw_a = g_adc1_current_raw;
       raw_b = g_adc2_current_raw;
       g_adc_sample_ready = 0U;
-
       __enable_irq();
 
-      /*
-       * Convert ADC raw values into Ia, Ib and Ic.
-       */
       g_phase_current =
           current_sense_get_phase_current(raw_a, raw_b);
 
@@ -620,41 +687,16 @@ int main(void)
         continue;
       }
 
-      /*
-       * Adapt the current-sense structure to the FOC structure.
-       */
-      Phase3 phase_current =
-      {
-        .a = g_phase_current.phase_a,
-        .b = g_phase_current.phase_b,
-        .c = g_phase_current.phase_c
-      };
-
-      /*
-       * Clarke transform:
-       * three-phase currents -> stationary alpha-beta currents.
-       */
-      AlphaBeta stationary =
-          foc_clarke(phase_current);
-
+      phase_current.a = g_phase_current.phase_a;
+      phase_current.b = g_phase_current.phase_b;
+      phase_current.c = g_phase_current.phase_c;
+      stationary = foc_clarke(phase_current);
       g_i_alpha = stationary.alpha;
       g_i_beta = stationary.beta;
 
-      /*
-       * Park transform:
-       * stationary alpha-beta currents -> rotating d-q currents.
-       *
-       * The Park transform uses the motor-side encoder electrical angle.
-       * The joint position loop uses the output-side encoder instead.
-       */
-      float sin_theta = sinf(g_electrical_angle);
-      float cos_theta = cosf(g_electrical_angle);
-
-      DqAxis rotating =
-          foc_park(stationary,
-                   sin_theta,
-                   cos_theta);
-
+      sin_theta = sinf(g_electrical_angle);
+      cos_theta = cosf(g_electrical_angle);
+      rotating = foc_park(stationary, sin_theta, cos_theta);
       g_i_d = rotating.d;
       g_i_q = rotating.q;
 
@@ -670,6 +712,26 @@ int main(void)
         motor_pwm_set_neutral();
       }
     }
+
+    if ((uint32_t)(g_tick_ms - last_report_ms) >= 10U)
+    {
+      CanFdStatus status;
+
+      last_report_ms = g_tick_ms;
+      status.position = g_joint_position;
+      status.velocity = g_joint_speed;
+      status.torque = g_iq_reference * MOTOR_TORQUE_CONSTANT;
+      status.current = g_i_q;
+      status.bus_voltage = bus_voltage_get();
+      status.temperature = 0.0f;
+      status.fault_code = (uint32_t)g_motor_controller.fault |
+                          canfd_app_fault_code();
+      (void)canfd_app_send_status(&status);
+    }
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
@@ -886,6 +948,49 @@ static void MX_ADC2_Init(void)
   /* USER CODE BEGIN ADC2_Init 2 */
 
   /* USER CODE END ADC2_Init 2 */
+
+}
+
+/**
+  * @brief FDCAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN1_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN1_Init 0 */
+
+  /* USER CODE END FDCAN1_Init 0 */
+
+  /* USER CODE BEGIN FDCAN1_Init 1 */
+
+  /* USER CODE END FDCAN1_Init 1 */
+  hfdcan1.Instance = FDCAN1;
+  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
+  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
+  hfdcan1.Init.TransmitPause = DISABLE;
+  hfdcan1.Init.ProtocolException = DISABLE;
+  hfdcan1.Init.NominalPrescaler = 17;
+  hfdcan1.Init.NominalSyncJumpWidth = 1;
+  hfdcan1.Init.NominalTimeSeg1 = 15;
+  hfdcan1.Init.NominalTimeSeg2 = 4;
+  hfdcan1.Init.DataPrescaler = 5;
+  hfdcan1.Init.DataSyncJumpWidth = 1;
+  hfdcan1.Init.DataTimeSeg1 = 12;
+  hfdcan1.Init.DataTimeSeg2 = 4;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN1_Init 2 */
+
+  /* USER CODE END FDCAN1_Init 2 */
 
 }
 
