@@ -31,6 +31,8 @@
 #include "motion_control.h"
 #include "dual_encoder.h"
 #include "dual_encoder_spi.h"
+#include "encoder_hal_spi.h"
+#include "magnetic_encoder_protocol.h"
 #include "canfd_app.h"
 #include <math.h>
 /* USER CODE END Includes */
@@ -58,6 +60,9 @@ ADC_HandleTypeDef hadc2;
 FDCAN_HandleTypeDef hfdcan1;
 
 UART_HandleTypeDef hlpuart1;
+
+SPI_HandleTypeDef hspi1;
+SPI_HandleTypeDef hspi3;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim6;
@@ -106,6 +111,22 @@ float g_i_q = 0.0f;
 DualEncoderController g_dual_encoder;
 DualEncoderSpiController g_dual_encoder_spi;
 uint8_t g_dual_encoder_spi_ready = 0U;
+MagneticEncoderDiagnostics g_motor_encoder_diagnostics;
+MagneticEncoderDiagnostics g_joint_encoder_diagnostics;
+EncoderHalSpiContext g_motor_encoder_spi_context =
+{
+    .hspi = &hspi1,
+    .cs_port = MOTOR_ENCODER_CS_GPIO_Port,
+    .cs_pin = MOTOR_ENCODER_CS_Pin,
+    .timeout_ms = 2U
+};
+EncoderHalSpiContext g_joint_encoder_spi_context =
+{
+    .hspi = &hspi3,
+    .cs_port = JOINT_ENCODER_CS_GPIO_Port,
+    .cs_pin = JOINT_ENCODER_CS_Pin,
+    .timeout_ms = 2U
+};
 float g_motor_mechanical_angle = 0.0f;
 float g_joint_position = 0.0f;
 float g_motor_speed = 0.0f;
@@ -155,6 +176,8 @@ static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_FDCAN1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_SPI3_Init(void);
 /* USER CODE BEGIN PFP */
 static void motor_control_run_current_loop(void);
 static void motor_control_apply_pending_command(void);
@@ -164,6 +187,7 @@ static MotorFault motor_control_check_protection(
     const PhaseCurrent *phase_current);
 static void motor_control_reset_current_pi(void);
 static void motor_control_reset_outer_loops(void);
+static void motor_encoder_hardware_init(const DualEncoderConfig *config);
 
 /* USER CODE END PFP */
 
@@ -296,7 +320,11 @@ static void motor_control_init(void)
                       &encoder_config,
                       g_simulated_motor_encoder_angle,
                       g_simulated_joint_encoder_angle);
+    motor_encoder_hardware_init(&encoder_config);
+
     const DualEncoderState *encoder_state =
+        (g_dual_encoder_spi_ready != 0U) ?
+        dual_encoder_spi_get_state(&g_dual_encoder_spi) :
         dual_encoder_get_state(&g_dual_encoder);
     g_motor_mechanical_angle = encoder_state->motor_mechanical_angle;
     g_joint_position = encoder_state->joint_position;
@@ -310,6 +338,59 @@ static void motor_control_init(void)
     g_outer_loop_divider = 0U;
     g_position_loop_divider = 0U;
     motor_pwm_disable_outputs();
+}
+
+static void motor_encoder_hardware_init(const DualEncoderConfig *config)
+{
+    static const uint8_t kth7112_read_angle_command[4] =
+    {
+        0x00U, 0x00U, 0x00U, 0x00U
+    };
+    static const uint8_t ktm5910_read_angle_command[5] =
+    {
+        0x43U, 0x00U, 0x00U, 0x00U, 0x00U
+    };
+    EncoderSpiDevice motor_encoder;
+    EncoderSpiDevice joint_encoder;
+    float discard_angle;
+    const EncoderSpiBus motor_bus =
+    {
+        .transfer = encoder_hal_spi_transfer,
+        .context = &g_motor_encoder_spi_context
+    };
+    const EncoderSpiBus joint_bus =
+    {
+        .transfer = encoder_hal_spi_transfer,
+        .context = &g_joint_encoder_spi_context
+    };
+
+    encoder_spi_device_init(&motor_encoder,
+                            &motor_bus,
+                            kth7112_decode_spi_angle,
+                            &g_motor_encoder_diagnostics,
+                            kth7112_read_angle_command,
+                            sizeof(kth7112_read_angle_command));
+    encoder_spi_device_init(&joint_encoder,
+                            &joint_bus,
+                            ktm5910_decode_spi_angle,
+                            &g_joint_encoder_diagnostics,
+                            ktm5910_read_angle_command,
+                            sizeof(ktm5910_read_angle_command));
+
+    (void)encoder_spi_device_read_angle(&joint_encoder,
+                                        &discard_angle);
+
+    if (dual_encoder_spi_init(&g_dual_encoder_spi,
+                              config,
+                              &motor_encoder,
+                              &joint_encoder) == ENCODER_SPI_OK)
+    {
+        g_dual_encoder_spi_ready = 1U;
+    }
+    else
+    {
+        g_dual_encoder_spi_ready = 0U;
+    }
 }
 
 static void motor_control_reset_outer_loops(void)
@@ -549,6 +630,8 @@ int main(void)
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_FDCAN1_Init();
+  MX_SPI1_Init();
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
 
   /*
@@ -612,9 +695,6 @@ int main(void)
   canfd_app_init(&hfdcan1, 1U, 20U);
 
   /* USER CODE END 2 */
-
-  /* Initialize led */
-  BSP_LED_Init(LED_GREEN);
 
   /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
@@ -1042,6 +1122,86 @@ static void MX_LPUART1_UART_Init(void)
 }
 
 /**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 7;
+  hspi1.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief SPI3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI3_Init(void)
+{
+
+  /* USER CODE BEGIN SPI3_Init 0 */
+
+  /* USER CODE END SPI3_Init 0 */
+
+  /* USER CODE BEGIN SPI3_Init 1 */
+
+  /* USER CODE END SPI3_Init 1 */
+  /* SPI3 parameter configuration*/
+  hspi3.Instance = SPI3;
+  hspi3.Init.Mode = SPI_MODE_MASTER;
+  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi3.Init.NSS = SPI_NSS_SOFT;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi3.Init.CRCPolynomial = 7;
+  hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi3.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI3_Init 2 */
+
+  /* USER CODE END SPI3_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -1194,6 +1354,7 @@ static void MX_TIM6_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -1204,7 +1365,20 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, MOTOR_ENCODER_CS_Pin|JOINT_ENCODER_CS_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : MOTOR_ENCODER_CS_Pin JOINT_ENCODER_CS_Pin */
+  GPIO_InitStruct.Pin = MOTOR_ENCODER_CS_Pin|JOINT_ENCODER_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  HAL_GPIO_WritePin(GPIOC,
+                    MOTOR_ENCODER_CS_Pin | JOINT_ENCODER_CS_Pin,
+                    GPIO_PIN_SET);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -1246,18 +1420,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  static uint16_t led_divider = 0;
-
   if (htim->Instance == TIM6)
   {
     g_tick_ms++;
-
-    if (++led_divider >= 500U)
-    {
-      led_divider = 0;
-
-      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-    }
   }
 }
 

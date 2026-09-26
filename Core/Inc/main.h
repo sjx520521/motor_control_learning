@@ -69,6 +69,10 @@ void Error_Handler(void);
 #define RCC_OSC_IN_GPIO_Port GPIOF
 #define RCC_OSC_OUT_Pin GPIO_PIN_1
 #define RCC_OSC_OUT_GPIO_Port GPIOF
+#define MOTOR_ENCODER_CS_Pin GPIO_PIN_8
+#define MOTOR_ENCODER_CS_GPIO_Port GPIOC
+#define JOINT_ENCODER_CS_Pin GPIO_PIN_9
+#define JOINT_ENCODER_CS_GPIO_Port GPIOC
 #define T_SWDIO_Pin GPIO_PIN_13
 #define T_SWDIO_GPIO_Port GPIOA
 #define T_SWCLK_Pin GPIO_PIN_14
